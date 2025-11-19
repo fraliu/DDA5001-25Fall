@@ -7,7 +7,7 @@ Speak, speak.
 First Citizen:
 You are all resolved rather to die than to famish?
 
-All:
+All:n
 Resolved. resolved.
 
 First Citizen:
