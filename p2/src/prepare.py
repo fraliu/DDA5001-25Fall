@@ -64,33 +64,40 @@ def prepare_tokenize_and_save(
         responses = examples[response_column]
 
         # TODO:
+        system_instruction = "\nPlease reason step by step, and put your final answer within \\boxed{}."
+
         # We need to convert the chat templates to strings first to use the main tokenizer call
         full_chats = [
             [
-                {"role": "user", "content": p + XXX},
+                {"role": "user", "content": p + system_instruction},
                 {"role": "assistant", "content": r},
             ]
             for p, r in zip(prompts, responses)
         ]
         full_texts = [
-            tokenizer.apply_chat_template(conversation=XXX,
-                                          tokenize=False,
-                                          add_generation_prompt=False,
-                                          enable_thinking=False)
-            for XXX in XXX
+            tokenizer.apply_chat_template(
+                conversation=chat,
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False
+            )
+            for chat in full_chats
         ]
 
 
         # Tokenize prompts separately to calculate their length for masking
         prompt_only_chats = [
-            [{"role": "user", "content": p + XXX}] for p in prompts
+            [{"role": "user", "content": p + system_instruction}] for p in prompts
         ]
+
         prompt_texts = [
-            tokenizer.apply_chat_template(conversation=XXX,
-                                          tokenize=False,
-                                          add_generation_prompt=True,
-                                          enable_thinking=False)
-            for XXX in XXX
+            tokenizer.apply_chat_template(
+                conversation=chat,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False
+            )
+            for chat in prompt_only_chats
         ]
 
         # Use the tokenizer's main `__call__` method to get input_ids AND attention_mask
@@ -109,7 +116,7 @@ def prepare_tokenize_and_save(
         for i, full_ids in enumerate(tokenized_outputs["input_ids"]):
             prompt_len = len(tokenized_prompts["input_ids"][i])
             label = list(full_ids)  # Copy input_ids
-            label[:XXX] = [-100] * XXX  # Mask prompt when calculating loss
+            label[:prompt_len] = [-100] * prompt_len  # Mask prompt when calculating loss
             labels_list.append(label)
 
         # Add labels to our dictionary

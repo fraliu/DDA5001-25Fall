@@ -21,7 +21,7 @@ def set_seed(seed):
 set_seed(42)
 
 
-def main(model_name, output_filename, lora_path=None):
+def main(model_name, output_filename, lora_path=None, gpu_id=None):
     """
     Runs the MATH-500 test set evaluation with a specified model and an optional local LoRA adapter,
     and saves the results to a specified CSV file.
@@ -40,11 +40,10 @@ def main(model_name, output_filename, lora_path=None):
     # 2. Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-    # TODO:
     # Prepare chat-style prompts
     prompt_chats = [
         [
-            {"role": "user", "content": p + XXX}
+            {"role": "user", "content": p}
         ]
         for p in prompts
     ]
@@ -52,12 +51,12 @@ def main(model_name, output_filename, lora_path=None):
     # Apply chat template to each
     prompt_strs = [
         tokenizer.apply_chat_template(
-            conversation=XXX,
+            conversation=prompt_chat,
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=False,
         )
-        for XXX in XXX
+        for prompt_chat in prompt_chats
     ]
 
     # 3. Create vLLM LLM with conditional LoRA support
@@ -147,5 +146,15 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, required=True, help="The Hugging Face model to use for generation.")
     parser.add_argument("--output_file", type=str, required=True, help="The path to the output CSV file.")
     parser.add_argument("--lora_path", type=str, default=None, help="Optional: Path to the local directory containing the LoRA adapter files.")
+    
+    # 新增 GPU 选择参数
+    parser.add_argument("--gpu_id", type=str, default="0", help="Specific GPU ID to run on (e.g., '0', '1', '7').")
+    
     args = parser.parse_args()
-    main(args.model, args.output_file, args.lora_path)
+    
+    # 【重要】设置 GPU 环境变量
+    if args.gpu_id is not None:
+        print(f"Running on GPU: {args.gpu_id}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    
+    main(args.model, args.output_file, args.lora_path, args.gpu_id)

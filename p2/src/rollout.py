@@ -5,9 +5,7 @@ import random
 import numpy as np
 import torch
 from pathlib import Path
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel # Used for loading LoRA adapters
+
 
 def set_seed(seed):
     """Sets the seed for reproducibility."""
@@ -20,104 +18,118 @@ def set_seed(seed):
 set_seed(42)
 
 
-def main(model_name, output_filename, lora_path=None):
-    """
-    Runs the MATH-500 test set evaluation with a specified model and an optional local LoRA adapter
-    using the Hugging Face Transformers library, and saves the results to a specified JSONL file.
 
-    Args:
-        model_name (str): The name of the Hugging Face model to use (e.g., "Qwen/Qwen3-0.6B-Base").
-        output_filename (str): The name of the output JSONL file.
-        lora_path (str, optional): The path to the local directory containing the LoRA adapter files. 
-                                   Defaults to None.
+def main(model_name, output_filename, lora_path=None, is_local_model=False, gpu_id=None):
     """
+    Runs the MATH-500 test set evaluation.
+    """
+    # ------------------------------------------------------------------
+    # 【关键修改】将 HuggingFace 相关库的导入移到这里
+    # 确保在 if __name__ == "__main__" 中设置好代理/镜像后，才加载这些库
+    # ------------------------------------------------------------------
+    print("Importing Hugging Face libraries...")
+    from datasets import load_dataset
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from peft import PeftModel
+    # ------------------------------------------------------------------
+
     # 1. Load MATH-500 test set
+    print("Loading dataset...")
     ds = load_dataset("ricdomolm/MATH-500", split="test")
-    prompts = ds["problem"]  # question text
-    gold_answers = ds["answer"]  # gold answers aligned by index
+    prompts = ds["problem"]
+    gold_answers = ds["answer"]
 
     # 2. Initialize Tokenizer and Model
-    # padding_side='left' to resolve the warning and ensure correct generation
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side='left')
-    
-    # Set pad token if it's not set, which is required for batch generation
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    system_instruction = "\nPlease reason step by step, and put your final answer within \\boxed{}."
 
-    # TODO:
-    # Prepare chat-style prompts
     prompt_chats = [
         [
-            {"role": "user", "content": p + XXX}
+            {"role": "user", "content": p + system_instruction}
         ]
         for p in prompts
     ]
 
-    # Apply chat template to each
     prompt_strs = [
         tokenizer.apply_chat_template(
-            conversation=XXX,
+            conversation=prompt_chat,
             add_generation_prompt=True,
             tokenize=False,
             enable_thinking=False,
         )
-        for XXX in XXX
+        for prompt_chat in prompt_chats
     ]
 
-    # 3. Create Transformers Model with conditional LoRA support
-    print(f"Loading base model: {model_name}")
-    
-    # The inference speed will be significantly slower if we use float32 here.
+    # 3. Create Transformers Model
+    if is_local_model:
+        print(f"Loading local fine-tuned model from: {model_name}")
+    else:
+        print(f"Loading base model: {model_name}")
+
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+
+    # 根据gpu_id设置device_map
+    if gpu_id is not None:
+        print(f"Using specified GPU: {gpu_id}")
+        device_map = {"": int(gpu_id)}
+    else:
+        # 使用auto模式，但会受到CUDA_VISIBLE_DEVICES的限制
+        device_map = "auto"
+        
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
         torch_dtype=dtype,
-        device_map="auto"  # Automatically maps the model to available GPUs
+        device_map=device_map
     )
 
     if lora_path:
         print(f"LoRA adapter specified. Loading from local path: {lora_path}")
-        
-        # Validate that the path is a valid directory
         if not os.path.isdir(lora_path):
             raise ValueError(f"LoRA path '{lora_path}' is not a valid directory.")
-            
-        # Load the LoRA adapter and merge it into the base model
-        model = PeftModel.from_pretrained(model, lora_path)
-        model = model.merge_and_unload()
-        print("Successfully merged LoRA adapter into the base model.")
+
+        try:
+            # 使用load_adapter方法代替PeftModel.from_pretrained
+            # 这是更现代的方法，适用于较新的PEFT版本
+            model.load_adapter(lora_path)
+            print("Successfully loaded LoRA adapter.")
+        except (AttributeError, TypeError) as e:
+            print(f"Failed to load adapter directly: {e}. Trying PeftModel approach...")
+            # 回退到PeftModel方法
+            model = PeftModel.from_pretrained(model, lora_path)
+            model = model.merge_and_unload()
+            print("Successfully merged LoRA adapter into the base model.")
     else:
         print("No LoRA adapter specified, running the base model.")
-    
-    model.eval() # Set the model to evaluation mode
 
-    # Generation parameters (equivalent to vLLM's SamplingParams)
+    model.eval()
+
     generation_kwargs = {
         "temperature": 1.0,
         "top_p": 0.95,
-        "max_new_tokens": 512,  # Note: transformers uses max_new_tokens
+        "max_new_tokens": 512,
         "repetition_penalty": 1.0,
-        "do_sample": True, # Required for temperature and top_p to have an effect
+        "do_sample": True,
     }
 
     # 4. Generate in batches
-    batch_size = 64 # A smaller batch size is often safer for Transformers to avoid OOM issues
+    batch_size = 4
     results = []
-    for i in range(0, len(prompt_strs), batch_size):
-        batch = prompt_strs[i : i + batch_size]
-        
-        # Tokenize the batch of prompts
-        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512).to(model.device)
 
-        # Generate text using the model
+    total_batches = (len(prompt_strs) + batch_size - 1) // batch_size
+
+    for i in range(0, len(prompt_strs), batch_size):
+        batch = prompt_strs[i: i + batch_size]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(model.device)
+
         with torch.no_grad():
             outputs = model.generate(**inputs, **generation_kwargs)
-        
-        # Decode only the newly generated tokens, skipping the prompt
+
         generated_texts = tokenizer.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
-        # Process and store results
         for idx, gen_text in enumerate(generated_texts):
             orig_idx = i + idx
             results.append({
@@ -126,22 +138,51 @@ def main(model_name, output_filename, lora_path=None):
                 "answer": gen_text,
                 "gold": gold_answers[orig_idx]
             })
-        print(f"Processed batch {i//batch_size + 1}/{(len(prompt_strs) + batch_size - 1)//batch_size}")
+        print(f"Processed batch {i // batch_size + 1}/{total_batches}")
 
     # 5. Save to JSONL
     output_path = Path(output_filename)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Output will be saved to: {output_path.resolve()}")
+
     with open(output_path, "w", encoding="utf-8") as f:
         for row in results:
-            f.write(json.dumps(row) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     print(f"Saved generations to {output_path.resolve()}")
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run MATH-500 evaluation with HF Transformers and an optional local LoRA adapter.")
-    parser.add_argument("--model", type=str, required=True, help="The Hugging Face model to use for generation.")
-    parser.add_argument("--output_file", type=str, required=True, help="The path to the output JSONL file.")
-    parser.add_argument("--lora_path", type=str, default=None, help="Optional: Path to the local directory containing the LoRA adapter files.")
+    parser = argparse.ArgumentParser(
+        description="Run MATH-500 evaluation on a specific GPU.")
+    parser.add_argument("--model", type=str, required=True,
+                        help="The Hugging Face model path.")
+    parser.add_argument("--output_file", type=str, required=True, help="Output JSONL file path.")
+    parser.add_argument("--lora_path", type=str, default=None,
+                        help="Optional: Path to LoRA adapter.")
+    parser.add_argument("--is_local_model", action="store_true",
+                        help="Set if model is a local path.")
+
+    # 新增 GPU 选择参数
+    parser.add_argument("--gpu_id", type=str, default="0",
+                        help="Specific GPU ID to run on (e.g., '0', '1', '7').")
+
+    # 代理与镜像设置
+    parser.add_argument("--hf_endpoint", type=str, default="https://hf-mirror.com", help="HF Mirror Endpoint.")
+    parser.add_argument("--proxy", type=str, default=None, help="Network Proxy.")
+
     args = parser.parse_args()
-    main(args.model, args.output_file, args.lora_path)
+
+    # 【重要】设置 GPU 环境变量
+    # 必须在加载任何模型相关库之前设置，否则 device_map="auto" 会占用所有卡
+    if args.gpu_id is not None:
+        print(f"Running on GPU: {args.gpu_id}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+
+    # 设置网络环境变量
+    if args.hf_endpoint:
+        os.environ["HF_ENDPOINT"] = args.hf_endpoint
+    if args.proxy:
+        os.environ["http_proxy"] = args.proxy
+        os.environ["https_proxy"] = args.proxy
+
+    main(args.model, args.output_file, args.lora_path, args.is_local_model, args.gpu_id)
